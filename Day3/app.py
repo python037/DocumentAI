@@ -1,9 +1,5 @@
 # app.py
 
-# =======================
-# ======= Imports =======
-# =======================
-
 import io
 import os
 import threading
@@ -19,13 +15,12 @@ from flask_cors import CORS
 from langchain.embeddings.base import Embeddings
 from langchain.text_splitter import \
     RecursiveCharacterTextSplitter  # (default text splitter)
-from langchain_experimental.text_splitter import \
-    SemanticChunker  # (optional, for semantic chunking)
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-
+from langchain_experimental.text_splitter import \
+    SemanticChunker  # (optional, for semantic chunking)
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from PIL import Image
 
@@ -33,7 +28,7 @@ from PIL import Image
 # App and Global Configuration
 # =============================================================================
 
-load_dotenv(r"C:\ML\LU-LiveClasses\DocumentAI\.env")
+load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
@@ -85,7 +80,7 @@ _EMBEDDINGS: Optional[Embeddings] = None
 
 
 # =============================================================================
-# Utility Functions
+# Utility and Core Functions
 # =============================================================================
 
 def get_embeddings() -> Embeddings:
@@ -107,6 +102,7 @@ def get_embeddings() -> Embeddings:
         _EMBEDDINGS = SentenceTransformerEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     return _EMBEDDINGS
 
+
 def load_vector_store(allow_create_empty: bool = True) -> Optional[FAISS]:
     """
     Load the FAISS vector store from disk. If not found and allow_create_empty is False,
@@ -124,18 +120,76 @@ def load_vector_store(allow_create_empty: bool = True) -> Optional[FAISS]:
         return None
     return None
 
+
 def save_vector_store(store: FAISS) -> None:
     """
     Persist the FAISS vector store to disk at VECTOR_DIR.
     """
     store.save_local(VECTOR_DIR)
 
-def build_text_splitter():
-    pass
+
+def build_text_splitter(
+    mode: str = CHUNKING_MODE_DEFAULT,
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP,
+):
+    """
+    Build and return a text splitter based on the selected mode.
+    - recursive: RecursiveCharacterTextSplitter
+    - semantic: SemanticChunker (requires embeddings)
+    """
+    mode = (mode or "recursive").strip().lower()
+    if mode == "semantic":
+        embeddings = get_embeddings()
+        return SemanticChunker(
+            embeddings=embeddings,
+            breakpoint_threshold_type=SEMANTIC_BREAKPOINT_TYPE,
+            breakpoint_threshold_amount=SEMANTIC_BREAKPOINT_AMOUNT,
+        )
+    # default fallback: recursive
+    return RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
 
+def chunk_documents(
+    docs: List[Document],
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP,
+    chunking_mode: str = CHUNKING_MODE_DEFAULT,
+) -> List[Document]:
+    """
+    Split a list of Documents into chunks using the configured splitter.
+    Supports:
+    - recursive (default)
+    - semantic (optional)
+    """
+    splitter = build_text_splitter(mode=chunking_mode, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return splitter.split_documents(docs)
 
 
+def add_documents_to_index(
+    docs: List[Document],
+    chunking_mode: str = CHUNKING_MODE_DEFAULT,
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP,
+) -> Tuple[int, int]:
+    """
+    Add Documents to FAISS index (create if needed), then persist.
+    Returns (num_original_docs, num_chunks_added).
+    """
+    if not docs:
+        return 0, 0
 
+    # Chunk first
+    chunks = chunk_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap, chunking_mode=chunking_mode)
 
+    embeddings = get_embeddings()
 
+    with INDEX_LOCK:
+        store = load_vector_store(allow_create_empty=True)
+        if store is None:
+            store = FAISS.from_documents(chunks, embeddings)
+        else:
+            store.add_documents(chunks)
+        save_vector_store(store)
+
+    return len(docs), len(chunks)
