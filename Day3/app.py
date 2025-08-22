@@ -317,7 +317,7 @@ def condense_question(question: str, session_id: str) -> str:
     if not history:
         return question
 
-    history_str = messages_to_history_str(history, max_turns=3)
+    history_str = messages_to_history_str(history, max_turns=6)
     prompt = (
         "Rewrite the follow-up question into a standalone question that can be understood without chat history. "
         "Only use information present in the chat history.\n\n"
@@ -335,3 +335,318 @@ def condense_question(question: str, session_id: str) -> str:
         print(f"[WARN] condense_question failed: {e}")
 
     return question
+
+
+def format_docs_for_context(docs: List[Document]) -> str:
+    """
+    Create a compact context string from retrieved documents, with citations.
+    """
+    lines = []
+    for d in docs:
+        m = d.metadata or {}
+        cite = f"{m.get('doc_id', '?')} p.{m.get('page', '?')}"
+        lines.append(f"[{cite}] {d.page_content}")
+    return "\n\n".join(lines)
+
+
+def answer_with_gemini(question: str, docs: List[Document]) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Generate a concise, source-backed answer using Gemini 1.5 Flash.
+    Returns (answer_text, citations_list).
+    """
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY not set. Cannot answer with Gemini.")
+
+    context = format_docs_for_context(docs)
+    prompt = (
+        "You are a concise assistant. Use ONLY the provided context to answer the question.\n"
+        "Always cite sources in brackets like [doc_id p.page]. If the answer is not in the context, say you don't know.\n\n"
+        f"Question: {question}\n\nContext:\n{context}\n\nAnswer:"
+    )
+
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    resp = model.generate_content(prompt)
+    answer = (resp.text or "").strip() if resp else ""
+
+    # Build citations list (top-k docs metadata)
+    citations: List[Dict[str, Any]] = []
+    for d in docs:
+        m = d.metadata or {}
+        citations.append({
+            "doc_id": m.get("doc_id"),
+            "page": m.get("page"),
+            "source": m.get("source"),
+            "kind": m.get("kind")
+        })
+    return answer, citations
+
+
+def retrieve_top_k(query: str, k: int = TOP_K_DEFAULT) -> List[Document]:
+    """
+    Retrieve top-k relevant Documents from FAISS using the configured embeddings.
+    """
+    store = load_vector_store(allow_create_empty=False)
+    if store is None:
+        return []
+    retriever = store.as_retriever(search_type="similarity", search_kwargs={"k": k})
+    return retriever.get_relevant_documents(query)
+
+
+# =============================================================================
+# Flask Endpoints
+# =============================================================================
+
+@app.route("/health", methods=["GET"])
+def health():
+    """
+    Health check endpoint.
+    """
+    return jsonify({
+        "status": "ok",
+        "embedding_backend": EMBEDDING_BACKEND,
+        "default_chunking_mode": CHUNKING_MODE_DEFAULT,
+        "semantic_breakpoint_type": SEMANTIC_BREAKPOINT_TYPE,
+        "semantic_breakpoint_amount": SEMANTIC_BREAKPOINT_AMOUNT,
+    })
+
+
+@app.route("/stats", methods=["GET"])
+def stats():
+    """
+    Return basic stats about the current FAISS store.
+    """
+    store = load_vector_store(allow_create_empty=True)
+    count = 0
+    if store is not None and hasattr(store, "docstore") and hasattr(store.docstore, "_dict"):
+        count = len(store.docstore._dict)
+
+    return jsonify({
+        "vector_dir": VECTOR_DIR,
+        "embedding_backend": EMBEDDING_BACKEND,
+        "documents_indexed": count,
+        "default_chunking_mode": CHUNKING_MODE_DEFAULT,
+        "semantic_breakpoint_type": SEMANTIC_BREAKPOINT_TYPE,
+        "semantic_breakpoint_amount": SEMANTIC_BREAKPOINT_AMOUNT,
+    })
+
+
+@app.route("/upload_docs", methods=["POST"])
+def upload_docs():
+    """
+    Upload and index document files (PDF/TXT). Accepts multiple files via 'files'.
+    For PDFs: extract text per page; fallback to OCR if needed.
+    For TXT: load file as a single document.
+    Optional multipart form fields:
+    - chunking or chunking_mode: "recursive" (default) or "semantic"
+    - chunk_size: int (for recursive mode only)
+    - chunk_overlap: int (for recursive mode only)
+    """
+    if "files" not in request.files:
+        return jsonify({"error": "No files part in request. Use form-data with 'files'."}), 400
+
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "No files uploaded."}), 400
+
+    # Read optional chunking controls from form
+    chunking_mode = (request.form.get("chunking") or request.form.get("chunking_mode") or CHUNKING_MODE_DEFAULT).strip().lower()
+    try:
+        chunk_size = int(request.form.get("chunk_size", CHUNK_SIZE))
+    except Exception:
+        chunk_size = CHUNK_SIZE
+    try:
+        chunk_overlap = int(request.form.get("chunk_overlap", CHUNK_OVERLAP))
+    except Exception:
+        chunk_overlap = CHUNK_OVERLAP
+
+    processed: List[Document] = []
+    num_files = len(files)
+
+    for f in files:
+        filename = f.filename or f"file_{uuid.uuid4().hex}"
+        ext = os.path.splitext(filename)[1].lower()
+
+        # Save to disk first (needed by PyPDFLoader)
+        dest_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{filename}")
+        f.save(dest_path)
+
+        try:
+            if ext == ".pdf":
+                docs = pdf_to_documents(dest_path)
+                # Fallback OCR for scanned PDFs or empty extraction
+                if not docs or sum(len(d.page_content or "") for d in docs) < 50:
+                    docs = ocr_pdf_pages(dest_path, dpi=200)
+                processed.extend(docs)
+            elif ext in (".txt", ".md"):
+                # Read text, build Document
+                with open(dest_path, "rb") as rf:
+                    text_bytes = rf.read()
+                processed.append(txt_to_document(text_bytes, filename))
+            else:
+                # Unsupported in this endpoint
+                pass
+        except Exception as e:
+            print(f"[ERROR] Failed processing {filename}: {e}")
+
+    d_count, c_count = add_documents_to_index(
+        processed,
+        chunking_mode=chunking_mode,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+
+    return jsonify({
+        "message": "Documents indexed.",
+        "files_processed": num_files,
+        "original_docs": d_count,
+        "chunks_added": c_count,
+        "chunking_mode_used": chunking_mode
+    })
+
+
+@app.route("/upload_images", methods=["POST"])
+def upload_images():
+    """
+    Upload and index image files (JPG/PNG/TIFF). Accepts multiple files via 'files'.
+    Each image is OCR'd with Tesseract and added to the vector store.
+    Optional multipart form fields:
+    - chunking or chunking_mode: "recursive" (default) or "semantic"
+    - chunk_size: int (for recursive mode only)
+    - chunk_overlap: int (for recursive mode only)
+    """
+    if "files" not in request.files:
+        return jsonify({"error": "No files part in request. Use form-data with 'files'."}), 400
+
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "No files uploaded."}), 400
+
+    # Read optional chunking controls from form
+    chunking_mode = (request.form.get("chunking") or request.form.get("chunking_mode") or CHUNKING_MODE_DEFAULT).strip().lower()
+    try:
+        chunk_size = int(request.form.get("chunk_size", CHUNK_SIZE))
+    except Exception:
+        chunk_size = CHUNK_SIZE
+    try:
+        chunk_overlap = int(request.form.get("chunk_overlap", CHUNK_OVERLAP))
+    except Exception:
+        chunk_overlap = CHUNK_OVERLAP
+
+    processed: List[Document] = []
+    num_files = len(files)
+
+    for f in files:
+        filename = f.filename or f"image_{uuid.uuid4().hex}.png"
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"):
+            continue
+        try:
+            img_bytes = f.read()
+            doc = ocr_image_bytes(img_bytes, filename)
+            if doc.page_content:
+                processed.append(doc)
+        except Exception as e:
+            print(f"[ERROR] OCR failed for {filename}: {e}")
+
+    d_count, c_count = add_documents_to_index(
+        processed,
+        chunking_mode=chunking_mode,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+
+    return jsonify({
+        "message": "Images OCR'd and indexed.",
+        "files_processed": num_files,
+        "original_docs": d_count,
+        "chunks_added": c_count,
+        "chunking_mode_used": chunking_mode
+    })
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    """
+    Chat with the vector-backed RAG assistant.
+    Body JSON:
+    - question: str (required)
+    - session_id: str (optional; for memory; new one will be created if missing)
+    - top_k: int (optional; default TOP_K_DEFAULT)
+    Returns:
+    - session_id
+    - question
+    - answer
+    - citations: list of {doc_id, page, source, kind}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    question = (data.get("question") or "").strip()
+    session_id = data.get("session_id")
+    top_k = int(data.get("top_k", TOP_K_DEFAULT))
+    if not question:
+        return jsonify({"error": "Missing 'question' in request body."}), 400
+
+    sid = ensure_session(session_id)
+
+    # Check store
+    store = load_vector_store(allow_create_empty=False)
+    if store is None:
+        return jsonify({"error": "Vector store empty. Upload documents/images first."}), 400
+
+    # Memory: add user turn first (so condensation sees it too)
+    CHAT_SESSIONS[sid].append({"role": "user", "content": question})
+
+    # Condense follow-up to standalone
+    standalone_q = condense_question(question, sid)
+
+    # Retrieve
+    docs = retrieve_top_k(standalone_q, k=top_k)
+
+    # Answer with Gemini
+    try:
+        answer, citations = answer_with_gemini(standalone_q, docs)
+    except Exception as e:
+        # On failure, remove the just-added user turn to keep memory clean
+        CHAT_SESSIONS[sid].pop()
+        return jsonify({"error": f"LLM error: {e}"}), 500
+
+    # Save assistant turn
+    CHAT_SESSIONS[sid].append({"role": "assistant", "content": answer})
+
+    return jsonify({
+        "session_id": sid,
+        "question": question,
+        "standalone_question": standalone_q,
+        "answer": answer,
+        "citations": citations
+    })
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+if __name__ == "__main__":
+    # --- Helpful prints on startup ---
+    print(f"Embedding backend: {EMBEDDING_BACKEND}")
+    print(f"Default chunking mode: {CHUNKING_MODE_DEFAULT}")
+    print(f"Semantic breakpoint: type={SEMANTIC_BREAKPOINT_TYPE}, amount={SEMANTIC_BREAKPOINT_AMOUNT}")
+    if EMBEDDING_BACKEND == "gemini" and not GOOGLE_API_KEY:
+        print("[WARN] EMBEDDING_BACKEND=gemini but GOOGLE_API_KEY is missing. Embeddings will fail.")
+    if not GOOGLE_API_KEY:
+        print("[WARN] GOOGLE_API_KEY missing. Chat and question condensation will be disabled.")
+
+    try:
+        # Verify tesseract availability
+        ver = pytesseract.get_tesseract_version()
+        print(f"Tesseract: {ver}")
+    except Exception as e:
+        print(f"[WARN] Tesseract not found or misconfigured: {e}")
+
+    # --- Warm up embeddings ---
+    try:
+        _ = get_embeddings()
+        print("Embeddings initialized.")
+    except Exception as e:
+        print(f"[WARN] Embeddings init failed: {e}")
+
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=True)
