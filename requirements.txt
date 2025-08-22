@@ -1,0 +1,27 @@
+# Web Framework & API
+Flask
+Flask-Cors
+requests
+gradio
+
+# LangChain Core & Integrations
+langchain
+langchain-community
+langchain-google-genai
+langchain-experimental
+
+# Vector Store & Embeddings
+faiss-cpu
+sentence-transformers
+
+# Google AI
+google-generativeai
+
+# Document & Image Processing
+PyMuPDF
+pypdf
+Pillow
+pytesseract
+
+# Utilities
+python-dotenv

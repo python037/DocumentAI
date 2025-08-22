@@ -1,0 +1,63 @@
+Day 1 and Day 2 have 6 notebooks to understand how PDF + Image upload, chunking and vector store work along with end to end RAG flow with Memory managed Chatbot
+
+DAY 3 contains:
+
+RAG Chat Assistant
+This is a simple Retrieval-Augmented Generation (RAG) application that allows you to upload documents and images, and then chat with them to get source-backed answers.
+
+The application has two main components:
+
+Flask Backend: Handles file processing, OCR, text chunking, vector indexing, and the RAG chain.
+
+Gradio Frontend: Provides a user-friendly web interface for uploading files and chatting.
+
+Features
+File Upload: Supports PDFs, text files, and images (PNG, JPG, TIFF).
+
+Automatic OCR: Extracts text from images and scanned PDFs.
+
+Vector Indexing: Creates a searchable knowledge base from your documents using FAISS.
+
+Chat Interface: Ask questions and get answers generated from the content of your files.
+
+Source Citations: Every answer includes citations pointing to the original source document and page number.
+
+Setup and Running
+You will need two separate terminal windows to run the backend and frontend.
+
+1. Run the Backend Server
+First, set up and start the Flask backend.
+
+# Navigate to your project directory
+
+# (Optional) Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install backend requirements
+pip install -r requirements.txt
+
+# Run the backend server
+python app.py
+
+The backend will be running at http://localhost:8000.
+
+2. Run the Frontend UI
+In a new terminal, start the Gradio frontend.
+
+# Navigate to your project directory (if not already there)
+
+# Activate the virtual environment if you created one
+source .venv/bin/activate # On Windows: .venv\Scripts\activate
+
+# Run the Gradio app
+python gradio_app.py
+
+Open your web browser and navigate to the URL provided (usually http://127.0.0.1:7860).
+
+How to Use
+Check Backend Status: On the Gradio UI, click the "Check Backend Status" button to ensure the frontend is connected to the backend.
+
+Upload Files: Go to the "Upload Files" tab, drag and drop your documents or images, and click the appropriate "Index" button.
+
+Chat: Go to the "Chat" tab, ask a question about your documents, and press Enter or click "Send". The answer and its sources will appear.
