@@ -82,3 +82,60 @@ CHAT_SESSIONS: Dict[str, List[Dict[str, str]]] = {}
 
 # --- Global Embeddings Instance (lazy init) ---
 _EMBEDDINGS: Optional[Embeddings] = None
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def get_embeddings() -> Embeddings:
+    """
+    Return a shared embeddings instance based on EMBEDDING_BACKEND.
+    - "minilm": sentence-transformers/all-MiniLM-L6-v2 (CPU-friendly)
+    - "gemini": Google text-embedding-004 (requires GOOGLE_API_KEY)
+    """
+    global _EMBEDDINGS
+    if _EMBEDDINGS is not None:
+        return _EMBEDDINGS
+
+    if EMBEDDING_BACKEND == "gemini":
+        if not GOOGLE_API_KEY:
+            raise RuntimeError("GOOGLE_API_KEY is required for Gemini embeddings.")
+        _EMBEDDINGS = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    else:
+        # Default local embedding
+        _EMBEDDINGS = SentenceTransformerEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return _EMBEDDINGS
+
+def load_vector_store(allow_create_empty: bool = True) -> Optional[FAISS]:
+    """
+    Load the FAISS vector store from disk. If not found and allow_create_empty is False,
+    returns None. Otherwise, returns a ready-to-use FAISS store (or None if empty).
+    """
+    embeddings = get_embeddings()
+    index_file = os.path.join(VECTOR_DIR, "index.faiss")
+    store_file = os.path.join(VECTOR_DIR, "index.pkl")
+
+    if os.path.exists(index_file) and os.path.exists(store_file):
+        # allow_dangerous_deserialization required when loading pickled docstore
+        return FAISS.load_local(VECTOR_DIR, embeddings, allow_dangerous_deserialization=True)
+
+    if not allow_create_empty:
+        return None
+    return None
+
+def save_vector_store(store: FAISS) -> None:
+    """
+    Persist the FAISS vector store to disk at VECTOR_DIR.
+    """
+    store.save_local(VECTOR_DIR)
+
+def build_text_splitter():
+    pass
+
+
+
+
+
+
+
