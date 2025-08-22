@@ -102,7 +102,6 @@ def get_embeddings() -> Embeddings:
         _EMBEDDINGS = SentenceTransformerEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     return _EMBEDDINGS
 
-
 def load_vector_store(allow_create_empty: bool = True) -> Optional[FAISS]:
     """
     Load the FAISS vector store from disk. If not found and allow_create_empty is False,
@@ -120,13 +119,11 @@ def load_vector_store(allow_create_empty: bool = True) -> Optional[FAISS]:
         return None
     return None
 
-
 def save_vector_store(store: FAISS) -> None:
     """
     Persist the FAISS vector store to disk at VECTOR_DIR.
     """
     store.save_local(VECTOR_DIR)
-
 
 def build_text_splitter(
     mode: str = CHUNKING_MODE_DEFAULT,
@@ -149,7 +146,6 @@ def build_text_splitter(
     # default fallback: recursive
     return RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
-
 def chunk_documents(
     docs: List[Document],
     chunk_size: int = CHUNK_SIZE,
@@ -164,7 +160,6 @@ def chunk_documents(
     """
     splitter = build_text_splitter(mode=chunking_mode, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     return splitter.split_documents(docs)
-
 
 def add_documents_to_index(
     docs: List[Document],
@@ -193,3 +188,85 @@ def add_documents_to_index(
         save_vector_store(store)
 
     return len(docs), len(chunks)
+
+def pdf_to_documents(pdf_path: str, source_id: Optional[str] = None) -> List[Document]:
+    """
+    Extract text from a PDF using PyPDFLoader (one Document per page).
+    Adds simple metadata for citations (source, page).
+    """
+    try:
+        loader = PyPDFLoader(pdf_path)
+        pages = loader.load()
+        # Attach/standardize metadata
+        for i, d in enumerate(pages):
+            d.metadata = d.metadata or {}
+            d.metadata.update({
+                "source": os.path.basename(pdf_path),
+                "doc_id": source_id or os.path.splitext(os.path.basename(pdf_path))[0],
+                "page": d.metadata.get("page", i + 1)
+            })
+        return pages
+    except Exception as e:
+        # print(f"[WARN] PyPDFLoader failed on {pdf_path}: {e}")
+        return []
+
+def ocr_image_bytes(image_bytes: bytes, source_name: str) -> Document:
+    """
+    OCR a single image (bytes) into a Document with metadata for citation.
+    """
+    img = Image.open(io.BytesIO(image_bytes))
+    text = pytesseract.image_to_string(img)
+    return Document(
+        page_content=text.strip(),
+        metadata={
+            "source": source_name,
+            "doc_id": os.path.splitext(os.path.basename(source_name))[0],
+            "page": None,
+            "kind": "image_ocr"
+        }
+    )
+
+def ocr_pdf_pages(pdf_path: str, dpi: int = 200) -> List[Document]:
+    """
+    OCR a PDF by rasterizing each page and running Tesseract OCR.
+    Use when text extraction fails (e.g., scanned PDFs).
+    """
+    out_docs: List[Document] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            for page_index in range(doc.page_count):
+                page = doc.load_page(page_index)
+                mat = fitz.Matrix(dpi / 72, dpi / 72)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                text = pytesseract.image_to_string(img)
+                out_docs.append(Document(
+                    page_content=text.strip(),
+                    metadata={
+                        "source": os.path.basename(pdf_path),
+                        "doc_id": os.path.splitext(os.path.basename(pdf_path))[0],
+                        "page": page_index + 1,
+                        "kind": "pdf_ocr"
+                    }
+                ))
+    except Exception as e:
+        print(f"[ERROR] OCR on PDF failed for {pdf_path}: {e}")
+    return out_docs
+
+def txt_to_document(text_bytes: bytes, filename: str) -> Document:
+    """
+    Convert a text file (bytes) to a single Document.
+    """
+    try:
+        content = text_bytes.decode("utf-8", errors="ignore")
+    except UnicodeDecodeError:
+        content = text_bytes.decode("latin-1", errors="ignore")
+    return Document(
+        page_content=content.strip(),
+        metadata={
+            "source": filename,
+            "doc_id": os.path.splitext(os.path.basename(filename))[0],
+            "page": None,
+            "kind": "text"
+        }
+    )
