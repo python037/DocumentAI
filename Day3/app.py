@@ -102,6 +102,7 @@ def get_embeddings() -> Embeddings:
         _EMBEDDINGS = SentenceTransformerEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     return _EMBEDDINGS
 
+
 def load_vector_store(allow_create_empty: bool = True) -> Optional[FAISS]:
     """
     Load the FAISS vector store from disk. If not found and allow_create_empty is False,
@@ -119,11 +120,13 @@ def load_vector_store(allow_create_empty: bool = True) -> Optional[FAISS]:
         return None
     return None
 
+
 def save_vector_store(store: FAISS) -> None:
     """
     Persist the FAISS vector store to disk at VECTOR_DIR.
     """
     store.save_local(VECTOR_DIR)
+
 
 def build_text_splitter(
     mode: str = CHUNKING_MODE_DEFAULT,
@@ -146,6 +149,7 @@ def build_text_splitter(
     # default fallback: recursive
     return RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
+
 def chunk_documents(
     docs: List[Document],
     chunk_size: int = CHUNK_SIZE,
@@ -160,6 +164,7 @@ def chunk_documents(
     """
     splitter = build_text_splitter(mode=chunking_mode, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     return splitter.split_documents(docs)
+
 
 def add_documents_to_index(
     docs: List[Document],
@@ -189,6 +194,7 @@ def add_documents_to_index(
 
     return len(docs), len(chunks)
 
+
 def pdf_to_documents(pdf_path: str, source_id: Optional[str] = None) -> List[Document]:
     """
     Extract text from a PDF using PyPDFLoader (one Document per page).
@@ -207,8 +213,9 @@ def pdf_to_documents(pdf_path: str, source_id: Optional[str] = None) -> List[Doc
             })
         return pages
     except Exception as e:
-        # print(f"[WARN] PyPDFLoader failed on {pdf_path}: {e}")
+        print(f"[WARN] PyPDFLoader failed on {pdf_path}: {e}")
         return []
+
 
 def ocr_image_bytes(image_bytes: bytes, source_name: str) -> Document:
     """
@@ -225,6 +232,7 @@ def ocr_image_bytes(image_bytes: bytes, source_name: str) -> Document:
             "kind": "image_ocr"
         }
     )
+
 
 def ocr_pdf_pages(pdf_path: str, dpi: int = 200) -> List[Document]:
     """
@@ -253,6 +261,7 @@ def ocr_pdf_pages(pdf_path: str, dpi: int = 200) -> List[Document]:
         print(f"[ERROR] OCR on PDF failed for {pdf_path}: {e}")
     return out_docs
 
+
 def txt_to_document(text_bytes: bytes, filename: str) -> Document:
     """
     Convert a text file (bytes) to a single Document.
@@ -270,3 +279,59 @@ def txt_to_document(text_bytes: bytes, filename: str) -> Document:
             "kind": "text"
         }
     )
+
+
+def ensure_session(session_id: Optional[str]) -> str:
+    """
+    Ensure a session_id exists; return an existing or newly created UUID.
+    """
+    if session_id and session_id in CHAT_SESSIONS:
+        return session_id
+    sid = session_id or str(uuid.uuid4())
+    CHAT_SESSIONS.setdefault(sid, [])
+    return sid
+
+
+def messages_to_history_str(messages: List[Dict[str, str]], max_turns: int = 6) -> str:
+    """
+    Convert recent messages into a string for question condensation prompt.
+    """
+    recent = messages[-(2 * max_turns):] if messages else []
+    lines = []
+    for m in recent:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def condense_question(question: str, session_id: str) -> str:
+    """
+    Rewrite a follow-up question into a standalone question using recent chat history.
+    Uses Gemini 1.5 Flash for a concise reformulation.
+    """
+    if not GOOGLE_API_KEY:
+        return question  # No LLM configured; skip condensation
+
+    history = CHAT_SESSIONS.get(session_id, [])
+    if not history:
+        return question
+
+    history_str = messages_to_history_str(history, max_turns=3)
+    prompt = (
+        "Rewrite the follow-up question into a standalone question that can be understood without chat history. "
+        "Only use information present in the chat history.\n\n"
+        f"Chat history:\n{history_str}\n\n"
+        f"Follow-up question: {question}\n\n"
+        "Standalone question:"
+    )
+
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        resp = model.generate_content(prompt)
+        if resp and resp.text:
+            return resp.text.strip()
+    except Exception as e:
+        print(f"[WARN] condense_question failed: {e}")
+
+    return question
